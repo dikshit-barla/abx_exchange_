@@ -37,6 +37,7 @@ node main.js
 
 ### 6. Navigate to Client Directory
 ```bash
+cd abx_exchange_
 cd abx_exchange_client
 ```
 
