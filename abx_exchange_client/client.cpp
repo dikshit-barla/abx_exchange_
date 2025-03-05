@@ -1,3 +1,14 @@
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #include <windows.h>
+#else
+    #include <arpa/inet.h>
+    #include <sys/socket.h>
+    #include <unistd.h>
+#endif
+
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -5,13 +16,10 @@
 #include <cstring>
 #include <algorithm>
 #include <sstream>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <errno.h>
 #include <iomanip>
 #include <chrono>
 #include <thread>
+#include <errno.h>
 
 // ANSI Color codes
 #define RESET   "\033[0m"
@@ -52,11 +60,17 @@ public:
 
 class ABXClient {
 private:
-    const char* hostname = "127.0.0.1";
-    const int port = 3000;
+    #ifdef _WIN32
+        WSADATA wsaData;
+        SOCKET socketFd;
+    #else
+        int socketFd;
+    #endif
+
+    const char* hostname;
+    const int port;
     std::vector<Packet> packets;
     std::set<int> receivedSequences;
-    int socketFd;
     std::chrono::steady_clock::time_point startTime;
 
     void displayHeader() {
@@ -79,11 +93,19 @@ private:
     }
 
     bool connectToServer() {
-        socketFd = socket(AF_INET, SOCK_STREAM, 0);
-        if (socketFd < 0) {
-            std::cerr << RED << "* Error creating socket" << RESET << std::endl;
-            return false;
-        }
+        #ifdef _WIN32
+            socketFd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (socketFd == INVALID_SOCKET) {
+                std::cerr << RED << "* Socket creation failed: " << WSAGetLastError() << RESET << std::endl;
+                return false;
+            }
+        #else
+            socketFd = socket(AF_INET, SOCK_STREAM, 0);
+            if (socketFd < 0) {
+                std::cerr << RED << "* Socket creation failed" << RESET << std::endl;
+                return false;
+            }
+        #endif
 
         struct sockaddr_in serverAddr;
         serverAddr.sin_family = AF_INET;
@@ -91,8 +113,13 @@ private:
         serverAddr.sin_addr.s_addr = inet_addr(hostname);
 
         if (connect(socketFd, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-            std::cerr << RED << "* Connection failed" << RESET << std::endl;
-            close(socketFd);
+            #ifdef _WIN32
+                std::cerr << RED << "* Connection failed: " << WSAGetLastError() << RESET << std::endl;
+                closesocket(socketFd);
+            #else
+                std::cerr << RED << "* Connection failed" << RESET << std::endl;
+                close(socketFd);
+            #endif
             return false;
         }
 
@@ -102,35 +129,45 @@ private:
 
     void sendRequest(uint8_t callType, uint8_t resendSeq = 0) {
         uint8_t request[2] = {callType, resendSeq};
-        if (send(socketFd, request, sizeof(request), 0) < 0) {
+        if (send(socketFd, reinterpret_cast<const char*>(request), sizeof(request), 0) < 0) {
             std::cerr << RED << "* Failed to send request" << RESET << std::endl;
         }
     }
 
     bool receivePacket(Packet& packet) {
         uint8_t buffer[17];
+        const size_t bufferSize = sizeof(buffer);  // Define buffer size as constant
         int bytesRead = 0;
-        int totalBytesRead = 0;
-
-        while (totalBytesRead < sizeof(buffer)) {
-            bytesRead = recv(socketFd, buffer + totalBytesRead, sizeof(buffer) - totalBytesRead, 0);
+        size_t totalBytesRead = 0;
+    
+        while (totalBytesRead < bufferSize) {  // Now comparing same types (size_t with size_t)
+            bytesRead = recv(socketFd, 
+                            reinterpret_cast<char*>(buffer) + totalBytesRead, 
+                            static_cast<int>(bufferSize - totalBytesRead), 
+                            0);
+            
             if (bytesRead <= 0) {
                 if (bytesRead == 0) {
                     return false; // Connection closed
                 }
-                if (errno == EINTR) continue; // Interrupted, try again
-                std::cerr << RED << "* Error receiving data: " << strerror(errno) << RESET << std::endl;
+                #ifdef _WIN32
+                    if (WSAGetLastError() == WSAEINTR) continue;
+                    std::cerr << RED << "* Error receiving data: " << WSAGetLastError() << RESET << std::endl;
+                #else
+                    if (errno == EINTR) continue;
+                    std::cerr << RED << "* Error receiving data: " << strerror(errno) << RESET << std::endl;
+                #endif
                 return false;
             }
-            totalBytesRead += bytesRead;
+            totalBytesRead += static_cast<size_t>(bytesRead);
         }
-
+    
         memcpy(packet.symbol, buffer, 4);
         packet.symbol[4] = '\0';
         packet.buySellindicator = buffer[4];
-        packet.quantity = ntohl(*(int32_t*)(buffer + 5));
-        packet.price = ntohl(*(int32_t*)(buffer + 9));
-        packet.packetSequence = ntohl(*(int32_t*)(buffer + 13));
+        packet.quantity = ntohl(*reinterpret_cast<int32_t*>(buffer + 5));
+        packet.price = ntohl(*reinterpret_cast<int32_t*>(buffer + 9));
+        packet.packetSequence = ntohl(*reinterpret_cast<int32_t*>(buffer + 13));
         
         return true;
     }
@@ -156,6 +193,15 @@ private:
         ss << "    }" << (isLast ? "\n" : ",\n");
         return ss.str();
     }
+
+    void closeSocket() {
+        #ifdef _WIN32
+            closesocket(socketFd);
+        #else
+            close(socketFd);
+        #endif
+    }
+
     void requestMissingSequences(int maxSequence) {
         std::cout << "\n" << MAGENTA << "-> Checking for missing sequences..." << RESET << std::endl;
         
@@ -184,7 +230,7 @@ private:
                     std::cout << GREEN << " + Retrieved successfully" << RESET;
                 }
                 
-                close(socketFd);
+                closeSocket();
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
@@ -197,7 +243,6 @@ private:
                      << " out of " << missingCount << " missing packets." << RESET << std::endl;
         }
     
-        // Display detailed summary
         std::cout << CYAN << "\nRetrieval Summary:" << RESET << std::endl;
         std::cout << "----------------" << std::endl;
         std::cout << "Total Sequences: " << maxSequence << std::endl;
@@ -231,6 +276,22 @@ private:
     }
 
 public:
+    ABXClient() : hostname("127.0.0.1"), port(3000) {
+        #ifdef _WIN32
+            int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+            if (result != 0) {
+                std::cerr << "WSAStartup failed: " << result << std::endl;
+                exit(1);
+            }
+        #endif
+    }
+
+    ~ABXClient() {
+        #ifdef _WIN32
+            WSACleanup();
+        #endif
+    }
+
     void run() {
         startTime = std::chrono::steady_clock::now();
         displayHeader();
@@ -250,7 +311,7 @@ public:
             processPacket(packet);
         }
 
-        close(socketFd);
+        closeSocket();
         std::cout << "\n" << GREEN << "+ Initial stream completed" << RESET << std::endl;
 
         int maxSequence = 0;
@@ -275,7 +336,12 @@ public:
 };
 
 int main() {
-    ABXClient client;
-    client.run();
+    try {
+        ABXClient client;
+        client.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
     return 0;
 }
